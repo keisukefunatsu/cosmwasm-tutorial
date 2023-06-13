@@ -1,6 +1,7 @@
-use crate::msg::{AdminListResp, ExecuteMsg, GreetResp, InstantiateMsg, QueryMsg};
+use crate::msg::{AdminListResp, ExecuteMsg, InstantiateMsg, QueryMsg};
 use cosmwasm_std::{
-    coins, to_binary, BankMsg, Binary, Deps, DepsMut, Env, Event, MessageInfo, Response, StdResult,
+    coins, to_binary, BankMsg, Binary, Deps, DepsMut, Env, Event, MessageInfo, Order, Response,
+    StdResult,
 };
 
 use crate::state::{ADMINS, DONATION_DENOM};
@@ -10,25 +11,22 @@ use crate::error::ContractError;
 use crate::msg::*;
 
 pub fn instantiate(
-    _deps: DepsMut,
-    _env: Env,
+    deps: DepsMut,
+    env: Env,
     _info: MessageInfo,
-    _msg: InstantiateMsg,
+    msg: InstantiateMsg,
 ) -> StdResult<Response> {
-    let admins: StdResult<Vec<_>> = _msg
-        .admins
-        .into_iter()
-        .map(|addr| _deps.api.addr_validate(&addr))
-        .collect();
-    ADMINS.save(_deps.storage, &admins?)?;
-    let _ = DONATION_DENOM.save(_deps.storage, &_msg.donation_denom);
+    for addr in msg.admins {
+        let admin = deps.api.addr_validate(&addr)?;
+        ADMINS.save(deps.storage, &admin, &env.block.time)?;
+    }
+    let _ = DONATION_DENOM.save(deps.storage, &msg.donation_denom);
     Ok(Response::new())
 }
 
 pub fn query(_deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     use QueryMsg::*;
 
-    // println!("{:?}", msg);
     match msg {
         AdminsList {} => to_binary(&query::admins_list(_deps)?),
     }
@@ -37,30 +35,26 @@ pub fn query(_deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
 mod query {
     use super::*;
 
-    pub fn greet() -> StdResult<GreetResp> {
-        let resp = GreetResp {
-            message: "Hello World".to_owned(),
-        };
-
-        Ok(resp)
-    }
-
     pub fn admins_list(deps: Deps) -> StdResult<AdminListResp> {
-        let admins = ADMINS.load(deps.storage)?;
+        let admins: Result<Vec<_>, _> = ADMINS
+            .keys(deps.storage, None, None, Order::Ascending)
+            .collect();
+        let admins = admins?;
         let resp = AdminListResp { admins };
+
         Ok(resp)
     }
 }
 
 pub fn execute(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
     use ExecuteMsg::*;
     match msg {
-        AddMembers { admins } => exec::add_members(deps, info, admins),
+        AddMembers { admins } => exec::add_members(deps, env, info, admins),
         Leave {} => exec::leave(deps, info),
         Donate {} => exec::donate(deps, info),
     }
@@ -70,10 +64,14 @@ mod exec {
     use super::*;
     pub fn add_members(
         deps: DepsMut,
+        env: Env,
         info: MessageInfo,
         admins: Vec<String>,
     ) -> Result<Response, ContractError> {
-        let mut current_admins = ADMINS.load(deps.storage)?;
+        let current_admins: Result<Vec<_>, _> = ADMINS
+            .keys(deps.storage, None, None, Order::Ascending)
+            .collect();
+        let current_admins = current_admins?;
         if !current_admins.contains(&info.sender) {
             return Err(ContractError::Unauthorized {
                 sender: info.sender,
@@ -87,30 +85,31 @@ mod exec {
             .add_events(events)
             .add_attribute("action", "add_members")
             .add_attribute("add_count", admins.len().to_string());
-        let admins: StdResult<Vec<_>> = admins
-            .into_iter()
-            .map(|addr| deps.api.addr_validate(&addr))
-            .collect();
-        current_admins.append(&mut admins?);
-        let _ = ADMINS.save(deps.storage, &current_admins);
+        let admins = admins.iter();
+        for addr in admins {
+            let admin = deps.api.addr_validate(&addr)?;
+            let now = &env.block.time;
+            ADMINS.save(deps.storage, &admin, now)?;
+        }
+
         Ok(resp)
     }
 
     pub fn leave(deps: DepsMut, info: MessageInfo) -> Result<Response, ContractError> {
-        let _ = ADMINS.update(deps.storage, move |admins| -> StdResult<_> {
-            let admins = admins
-                .into_iter()
-                .filter(|admin| *admin != info.sender)
-                .collect();
-            Ok(admins)
-        });
-        Ok(Response::new())
+        ADMINS.remove(deps.storage, &info.sender);
+        let resp = Response::new()
+            .add_attribute("action", "leave")
+            .add_attribute("sender", info.sender.as_str());
+        Ok(resp)
     }
 
     pub fn donate(deps: DepsMut, info: MessageInfo) -> Result<Response, ContractError> {
         let denom = DONATION_DENOM.load(deps.storage)?;
-        let admins = ADMINS.load(deps.storage)?;
-
+        // let admins = ADMINS.load(deps.storage)?;
+        let admins: Result<Vec<_>, _> = ADMINS
+            .keys(deps.storage, None, None, Order::Ascending)
+            .collect();
+        let admins = admins?;
         let donation = cw_utils::must_pay(&info, &denom)?.u128();
         let donation_per_admin = donation / (admins.len() as u128);
         let messages = admins.into_iter().map(|admin| BankMsg::Send {
